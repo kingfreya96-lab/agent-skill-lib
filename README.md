@@ -1,4 +1,4 @@
-# agent-skill-库
+# agent-skill-lib
 
 一处安装、所有 agent 共用的技能库管理工具。技能只存一份真实副本，各 agent 技能目录通过软链指向它，避免多副本内容漂移；同类技能自动生成「技能元」索引，先检索 3 行摘要再加载全文，节省 token。
 
@@ -16,8 +16,8 @@
 依赖：Python 3.10+、PyYAML。
 
 ```bash
-git clone git@github.com:kingfreya96-lab/agent-skill-库.git
-cd agent-skill-库
+git clone git@github.com:kingfreya96-lab/agent-skill-lib.git
+cd agent-skill-lib
 pip install pyyaml
 ln -s "$(pwd)/bin/askill" ~/.local/bin/askill
 ```
