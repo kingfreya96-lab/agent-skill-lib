@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""askill —— 一处安装，所有 agent 共用。
+
+技能只存一份在 ~/.agent-skills/<name>/，各 agent 的 skills 目录里放符号链接指过去。
+用法：
+  askill agents                     查看探测到的 agent 技能目录
+  askill add <目录|git地址> [--name]  安装技能到技能库并分发
+  askill link [名字...]              为技能库里的技能补/刷新软链
+  askill unlink [名字...]            移除软链（不动技能库）
+  askill list                       列出技能库与各 agent 的覆盖情况
+  askill doctor                     体检：格式、断链、重复副本、缺失分发
+  askill migrate [--apply]          把各 agent 里已有的重复副本收编进技能库
+  askill collect [--apply]          把任意 agent 里新建的技能收编进技能库
+  askill meta [--min N]             为同类技能生成技能元（3 行摘要检索，省 token）
+  askill clean [--apply]            清理空目录 / 断链
+  askill remove <名字> [--purge]     删除技能（--purge 连技能库一起删）
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HOME = Path.home()
+STORE = Path(os.environ.get("ASKILL_STORE", HOME / ".agent-skills"))
+BACKUP = STORE / ".backups"
+CONFIG = STORE / "config.json"
+
+SKIP_ENTRIES = {".system", ".backups", ".kits", "skill", "__pycache__"}
+META_SUFFIX = "-meta"
+META_MARKER = ".askill-generated"
+
+DEFAULT_CATEGORY_KEYWORDS = {
+    "pm": ["pm", "product", "prd", "okr", "roadmap", "metric", "user-story", "lifecycle"],
+    "office": ["docx", "xlsx", "pptx", "pdf", "word", "excel", "slide", "sheet", "office", "csv"],
+    "research": ["research", "reach", "search", "web", "news", "find", "lookup"],
+    "design": ["design", "ui", "ux", "frontend", "css", "taste", "figma", "visual", "style"],
+    "code": ["code", "dev", "git", "deploy", "test", "refactor", "bug", "pr", "project", "init"],
+    "review": ["review", "retro", "audit", "postmortem", "check"],
+    "media": ["video", "remotion", "audio", "image", "motion", "music", "podcast"],
+    "writing": ["blog", "post", "writer", "copy", "email", "mail", "draft", "translate"],
+    "data": ["data", "analytics", "stock", "finance", "market", "chart", "report"],
+    "agent": ["agent", "skill", "hook", "rule", "subagent", "mcp", "workflow", "automator"],
+}
+
+AGENTS: list[tuple[str, Path, bool]] = [
+    ("claude", HOME / ".claude/skills", False),
+    ("codex", HOME / ".codex/skills", False),
+    ("trae", HOME / ".trae/skills", False),
+    ("agents", HOME / ".agents/skills", False),
+    ("hermes", HOME / ".hermes/skills", False),
+    ("qoder", HOME / ".qoderwork/skills", False),
+    ("doubao", HOME / ".doubao/skills", False),
+    ("doubao-app", HOME / "Doubao/skills", False),
+    ("stepfun", HOME / ".stepfun/skills", False),
+    ("qclaw", HOME / ".qclaw/skills", False),
+    ("workbuddy", HOME / ".workbuddy-ai/skills", False),
+    ("loomy", HOME / ".config/loomy-opencode/skills", False),
+    ("cursor", HOME / ".cursor/skills-cursor", True),
+]
+
+GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty():
+    GREEN = YELLOW = RED = DIM = RESET = ""
+
+
+def ok(msg: str) -> None:
+    print(f"{GREEN}✓{RESET} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{YELLOW}!{RESET} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"{RED}✗{RESET} {msg}")
+
+
+def dim(msg: str) -> None:
+    print(f"{DIM}{msg}{RESET}")
+
+
+def load_config() -> dict:
+    if CONFIG.is_file():
+        try:
+            return json.loads(CONFIG.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            warn(f"config.json 解析失败，已忽略: {CONFIG}")
+    return {}
+
+
+def agent_dirs(include_managed: bool = False, create: bool = False) -> list[tuple[str, Path]]:
+    cfg = load_config()
+    disabled = set(cfg.get("disabled", []))
+    extra = {k: Path(v).expanduser() for k, v in cfg.get("extra_agents", {}).items()}
+    managed_ok = include_managed or bool(cfg.get("include_managed", False))
+
+    out: list[tuple[str, Path]] = []
+    for name, path, managed in AGENTS:
+        if name in disabled:
+            continue
+        if managed and not managed_ok:
+            continue
+        if path.is_dir():
+            out.append((name, path))
+        elif create and not managed:
+            out.append((name, path))
+    for name, path in extra.items():
+        if path.is_dir() or create:
+            out.append((name, path))
+    return out
+
+
+def parse_frontmatter(skill_md: Path) -> tuple[dict | None, str]:
+    text = skill_md.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return None, "SKILL.md 缺少 YAML frontmatter（文件必须以 --- 开头）"
+    parts = text.split("\n---", 2)
+    if len(parts) < 2:
+        return None, "SKILL.md frontmatter 未闭合"
+    raw = parts[0][3:]
+    try:
+        import yaml
+    except ImportError:
+        return None, "缺少 PyYAML，无法校验 frontmatter（pip install pyyaml）"
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        return None, f"frontmatter YAML 语法错误: {exc}"
+    if not isinstance(data, dict):
+        return None, "frontmatter 不是键值结构"
+    return data, ""
+
+
+def validate(skill_dir: Path) -> list[tuple[str, str]]:
+    issues: list[tuple[str, str]] = []
+    md = skill_dir / "SKILL.md"
+    if not md.is_file():
+        return [("error", "缺少 SKILL.md")]
+    data, problem = parse_frontmatter(md)
+    if data is None:
+        return [("error", problem)]
+    name = str(data.get("name", "")).strip()
+    desc = str(data.get("description", "")).strip()
+    if not name:
+        issues.append(("error", "frontmatter 缺少 name"))
+    elif name != skill_dir.name:
+        issues.append(("warn", f"name ({name}) 与目录名 ({skill_dir.name}) 不一致，部分 agent 会拒绝加载"))
+    if not desc:
+        issues.append(("error", "frontmatter 缺少 description，agent 无法判断何时调用"))
+    else:
+        if len(desc) < 30:
+            issues.append(("warn", f"description 只有 {len(desc)} 字符，触发词太少，容易不被自动调用"))
+        if len(desc) > 1024:
+            issues.append(("warn", f"description {len(desc)} 字符，超过 Claude Code 的 1024 上限"))
+    return issues
+
+
+def tree_digest(root: Path) -> str:
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and not p.is_symlink():
+            h.update(str(p.relative_to(root)).encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def store_skills() -> list[Path]:
+    if not STORE.is_dir():
+        return []
+    return sorted(
+        p for p in STORE.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in SKIP_ENTRIES
+    )
+
+
+def link_target(agent_dir: Path, name: str) -> Path:
+    return agent_dir / name
+
+
+def link_one(name: str, agent_dir: Path, force: bool = False, dry: bool = False) -> str:
+    src = STORE / name
+    dst = link_target(agent_dir, name)
+    if dst.is_symlink():
+        if Path(os.readlink(dst)) == src:
+            return "ok"
+        if dry:
+            return "refresh"
+        dst.unlink()
+        dst.symlink_to(src, target_is_directory=True)
+        return "refresh"
+    if dst.exists():
+        if not force:
+            return "conflict"
+        if dry:
+            return "replace"
+        backup = BACKUP / time.strftime("%Y%m%d-%H%M%S") / agent_dir.parent.name / name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(dst), str(backup))
+        dim(f"  已备份 {dst} -> {backup}")
+    if dry:
+        return "create"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    dst.symlink_to(src, target_is_directory=True)
+    return "create"
+
+
+def copy_into_store(src: Path, name: str, update: bool = False) -> bool:
+    dst = STORE / name
+    if dst.exists():
+        if not update:
+            err(f"技能库已存在 {name}，如需覆盖请加 --update")
+            return False
+        backup = BACKUP / time.strftime("%Y%m%d-%H%M%S") / "store" / name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(dst), str(backup))
+        dim(f"  旧版本已备份 -> {backup}")
+    STORE.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns("__pycache__", ".git", ".DS_Store"))
+    return True
+
+
+def resolve_source(target: str) -> Path:
+    p = Path(target).expanduser()
+    if p.is_dir():
+        return p
+    if target.startswith(("http://", "https://", "git@", "ssh://")):
+        tmp = Path(tempfile.mkdtemp(prefix="askill-"))
+        subprocess.run(["git", "clone", "--depth", "1", target, str(tmp / "repo")], check=True)
+        repo = tmp / "repo"
+        if (repo / "SKILL.md").is_file():
+            return repo
+        candidates = [d for d in repo.iterdir() if (d / "SKILL.md").is_file()]
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            return candidates[0]
+        raise SystemExit("克隆的仓库里找不到含 SKILL.md 的技能目录")
+    raise SystemExit(f"找不到技能源: {target}")
+
+
+BOILERPLATE = [
+    r"^use this skill (?:whenever|any time|anytime|when) the user (?:wants to|asks to|needs to|is working with)\s*",
+    r"^use this skill (?:whenever|any time|anytime|when)\s*",
+    r"^this skill should be used (?:when|if)\s*",
+    r"^must use (?:when|if)\s*",
+    r"^must be used (?:when|if)\s*",
+    r"^use when\s*",
+    r"^trigger when\s*",
+]
+
+
+def summarize(desc: str, limit: int = 70) -> str:
+    text = re.sub(r"\s+", " ", desc).strip()
+    for pat in BOILERPLATE:
+        stripped = re.sub(pat, "", text, flags=re.IGNORECASE)
+        if stripped != text:
+            text = stripped
+            break
+    text = re.split(r"[。;；]|\.\s", text)[0].strip(" ,.-—")
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text[0].upper() + text[1:] if text[0].islower() else text
+
+
+def skill_info(skill_dir: Path) -> dict:
+    md = skill_dir / "SKILL.md"
+    data, _ = parse_frontmatter(md) if md.is_file() else (None, "")
+    data = data or {}
+    desc = re.sub(r"\s+", " ", str(data.get("description") or "")).strip()
+    meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    inner = meta.get("hermes") if isinstance(meta.get("hermes"), dict) else meta
+    tags = inner.get("tags") or meta.get("tags") or data.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    category = inner.get("category") or meta.get("category") or data.get("category")
+    return {
+        "name": skill_dir.name,
+        "summary": summarize(desc) or "（无 description）",
+        "description": desc,
+        "tags": [str(t) for t in tags][:6],
+        "category": str(category).strip() if category else "",
+        "path": str(skill_dir),
+    }
+
+
+def category_keywords(cfg: dict) -> dict[str, list[str]]:
+    merged = {k: list(v) for k, v in DEFAULT_CATEGORY_KEYWORDS.items()}
+    for cat, words in (cfg.get("category_keywords") or {}).items():
+        merged[cat] = [str(w).lower() for w in words]
+    return merged
+
+
+def name_tokens(name: str) -> list[str]:
+    return [t for t in re.split(r"[-_./ ]+", name.lower()) if t]
+
+
+def infer_category(info: dict, prefix_counts: Counter, cfg: dict, mode: str) -> str:
+    if info["category"]:
+        return info["category"]
+    cat_map = cfg.get("categories") or {}
+    if info["name"] in cat_map:
+        return str(cat_map[info["name"]])
+    if mode == "flat":
+        return "all"
+    tokens = name_tokens(info["name"])
+    for cat, words in category_keywords(cfg).items():
+        if any(w in tokens or any(t.startswith(w) for t in tokens) for w in words):
+            return cat
+    prefix = tokens[0] if tokens else "other"
+    if mode == "prefix":
+        return prefix
+    return prefix if prefix_counts[prefix] >= 2 else "other"
+
+
+META_SCRIPT = '''#!/usr/bin/env python3
+"""技能元检索：按关键词/名称/标签返回 3 行摘要，不加载完整 SKILL.md。
+
+用法:
+    python3 meta.py --list
+    python3 meta.py --keyword "导出"
+    python3 meta.py --name docx
+    python3 meta.py --tag office
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+INDEX = Path(__file__).resolve().parent / "index.json"
+
+
+def load():
+    if not INDEX.is_file():
+        print(f"Error: {INDEX} not found")
+        sys.exit(1)
+    return json.loads(INDEX.read_text(encoding="utf-8"))
+
+
+def render(items, detail, title):
+    if not items:
+        print("没有匹配的技能。换个关键词，或用 --list 看全部。")
+        return
+    print(f"\\n=== {title} {len(items)} 个技能 ===\\n")
+    for it in items:
+        tags = ",".join(it.get("tags") or [])
+        if detail:
+            print(f"  {it['name']}")
+            print(f"    摘要：{it['summary']}")
+            print(f"    标签：{tags or '-'}")
+            print(f"    路径：{it['path']}/SKILL.md")
+            print()
+        else:
+            print(f"  {it['name']} — {it['summary']}" + (f" [{tags}]" if tags else ""))
+
+
+def main():
+    p = argparse.ArgumentParser(description="skill meta index search")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--keyword")
+    p.add_argument("--name")
+    p.add_argument("--tag")
+    p.add_argument("--detail", action="store_true")
+    a = p.parse_args()
+    data = load()
+    skills = data["skills"]
+    if a.list:
+        render(skills, a.detail, "全部")
+    elif a.name:
+        hit = [s for s in skills if s["name"].lower() == a.name.lower()]
+        render(hit, True, f"「{a.name}」")
+    elif a.tag:
+        hit = [s for s in skills if any(a.tag.lower() in t.lower() for t in (s.get("tags") or []))]
+        render(hit, a.detail, f"标签「{a.tag}」")
+    elif a.keyword:
+        kw = a.keyword.lower()
+        hit = [s for s in skills
+               if kw in s["name"].lower() or kw in s["summary"].lower()
+               or kw in s.get("description", "").lower()
+               or any(kw in t.lower() for t in (s.get("tags") or []))]
+        render(hit, a.detail, f"关键词「{a.keyword}」")
+    else:
+        print(f"{data['category']} 技能元：{data['total']} 个技能")
+        print("用 --list / --keyword / --name / --tag 检索；加 --detail 看路径。")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def meta_skill_md(cat: str, items: list[dict]) -> str:
+    rows = "\n".join(
+        f"| {it['name']} | {it['summary']} | {', '.join(it['tags']) or '-'} |" for it in items
+    )
+    desc = (
+        f"{len(items)} 个「{cat}」类技能的索引。按关键词、名称或标签检索，只返回 3 行摘要，"
+        "不加载完整 SKILL.md，用于快速定位并节省 token。当你不确定该类里该用哪个技能、"
+        "或只想快速确认某技能用途时使用；确定目标后再读它的 SKILL.md 执行。"
+    )
+    return f"""---
+name: {cat}-meta
+description: {desc}
+metadata:
+  generated_by: askill
+  category: {cat}
+  tags: [index, search, token-saving, {cat}]
+---
+
+# {cat} Meta — 技能元索引
+
+用一句话定位该类里该用哪个技能，只返回 3 行摘要，不加载完整文档。
+
+## 何时用
+
+- 知道要做什么，但不确定该类里该用哪个技能
+- 记得技能名，忘了它具体干什么
+- 想在不读完整 SKILL.md 的前提下浏览该类全部技能
+
+## 不适用
+
+- 已确定要用某个技能，需要完整步骤 → 直接读它的 SKILL.md
+- 要跨类浏览全部技能 → `askill list`
+
+## 命令
+
+```bash
+python3 ~/.agent-skills/{cat}-meta/meta.py --list
+python3 ~/.agent-skills/{cat}-meta/meta.py --keyword "导出"
+python3 ~/.agent-skills/{cat}-meta/meta.py --name docx
+python3 ~/.agent-skills/{cat}-meta/meta.py --tag {cat} --detail
+```
+
+输出（单行）：
+
+```
+  docx — 创建、读取、编辑 Word 文档 [office, document]
+```
+
+加 `--detail` 会多给路径，确认后再读那个 SKILL.md。
+
+## 技能清单（{len(items)} 个）
+
+| 技能 | 摘要 | 标签 |
+|---|---|---|
+{rows}
+"""
+
+
+def prune_meta(active: set[str], quiet: bool = False) -> None:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for d in STORE.glob(f"*{META_SUFFIX}"):
+        if not d.is_dir() or not (d / META_MARKER).is_file() or d.name in active:
+            continue
+        for _, path in agent_dirs(include_managed=True):
+            dst = path / d.name
+            if dst.is_symlink():
+                dst.unlink()
+        backup = BACKUP / stamp / "store" / d.name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(d), str(backup))
+        if not quiet:
+            warn(f"技能元 {d.name} 已无对应技能，已移除（备份 {backup}）")
+
+
+def build_meta(min_size: int = 2, mode: str = "auto", quiet: bool = False,
+               link: bool = True) -> dict[str, int]:
+    cfg = load_config()
+    skills = [s for s in store_skills() if not s.name.endswith(META_SUFFIX)]
+    if not skills:
+        return {}
+    infos = [skill_info(s) for s in skills]
+    prefix_counts = Counter((name_tokens(i["name"]) or ["other"])[0] for i in infos)
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for info in infos:
+        groups[infer_category(info, prefix_counts, cfg, mode)].append(info)
+
+    final: dict[str, list[dict]] = {}
+    others: list[dict] = []
+    for cat, items in groups.items():
+        if len(items) >= min_size:
+            final[cat] = items
+        else:
+            others.extend(items)
+    if len(others) >= min_size:
+        final["other"] = others
+    elif others and not quiet:
+        warn("以下技能未成类（同类不足 %d 个），未生成技能元: %s"
+             % (min_size, ", ".join(i["name"] for i in others)))
+
+    created: dict[str, int] = {}
+    for cat, items in sorted(final.items()):
+        meta_name = f"{cat}{META_SUFFIX}"
+        d = STORE / meta_name
+        if d.exists() and not (d / META_MARKER).is_file():
+            warn(f"{meta_name} 已存在且非 askill 生成，跳过（不覆盖手写技能元）")
+            continue
+        if not d.exists():
+            hand_written = [
+                agent for agent, path in agent_dirs(include_managed=True)
+                if (path / meta_name).exists() and not (path / meta_name).is_symlink()
+            ]
+            if hand_written:
+                warn(f"{meta_name} 已被 {', '.join(hand_written)} 中的手写技能元占用，跳过自动生成")
+                continue
+        d.mkdir(parents=True, exist_ok=True)
+        items = sorted(items, key=lambda x: x["name"])
+        index = {
+            "category": cat,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "total": len(items),
+            "skills": items,
+        }
+        (d / "index.json").write_text(
+            json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (d / "meta.py").write_text(META_SCRIPT, encoding="utf-8")
+        (d / "meta.py").chmod(0o755)
+        (d / "SKILL.md").write_text(meta_skill_md(cat, items), encoding="utf-8")
+        (d / META_MARKER).write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+        created[meta_name] = len(items)
+        if link:
+            for agent, path in agent_dirs(include_managed=cfg.get("include_managed", False)):
+                link_one(meta_name, path)
+
+    prune_meta(set(f"{c}{META_SUFFIX}" for c in final), quiet)
+    if created and not quiet:
+        ok("已刷新技能元: " + ", ".join(f"{k}({v} 个)" for k, v in created.items()))
+    return created
+
+
+def cmd_meta(args) -> int:
+    created = build_meta(min_size=args.min, mode=args.group_by, link=not args.no_link)
+    if not created:
+        warn("没有生成技能元：技能库里同类技能数量不足，可调低 --min")
+        return 0
+    return 0
+
+
+def cmd_collect(args) -> int:
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else set()
+    plan: list[tuple[str, Path, str]] = []
+    for agent, path in agent_dirs(include_managed=args.include_managed):
+        if args.from_agent and agent != args.from_agent:
+            continue
+        if not path.is_dir():
+            continue
+        for entry in sorted(path.iterdir()):
+            if entry.name in SKIP_ENTRIES or entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not (entry / "SKILL.md").is_file():
+                continue
+            if entry.name.endswith(META_SUFFIX) and (entry / META_MARKER).is_file():
+                continue
+            if only and entry.name not in only:
+                continue
+            dst = STORE / entry.name
+            if not dst.exists():
+                plan.append((agent, entry, "adopt"))
+            elif tree_digest(entry) == tree_digest(dst):
+                plan.append((agent, entry, "link"))
+            elif (entry / "SKILL.md").stat().st_mtime > (dst / "SKILL.md").stat().st_mtime:
+                plan.append((agent, entry, "newer-wins"))
+            else:
+                plan.append((agent, entry, "link-old"))
+
+    if not plan:
+        ok("没有发现需要收编的新技能")
+        return 0
+
+    labels = {
+        "adopt": "新技能，收编进技能库",
+        "link": "与技能库一致，换成软链",
+        "newer-wins": "agent 里更新，用它覆盖技能库",
+        "link-old": "技能库里更新，保留技能库版本",
+    }
+    print("收编计划：")
+    for agent, entry, action in plan:
+        print(f"  - [{agent}] {entry.name}: {labels[action]}")
+    if not args.apply:
+        print("\n这是 dry-run。确认无误后执行: askill collect --apply")
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    changed = 0
+    for agent, entry, action in plan:
+        dst = STORE / entry.name
+        if action == "adopt":
+            issues = validate(entry)
+            if any(lvl == "error" for lvl, _ in issues):
+                err(f"{entry.name}: 不合法，跳过收编")
+                for _, msg in issues:
+                    print(f"    - {msg}")
+                continue
+            STORE.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(entry), str(dst))
+            entry.symlink_to(dst, target_is_directory=True)
+            ok(f"{agent}: {entry.name} 已收编进技能库")
+        elif action == "newer-wins":
+            backup = BACKUP / stamp / "store" / entry.name
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dst), str(backup))
+            shutil.move(str(entry), str(dst))
+            entry.symlink_to(dst, target_is_directory=True)
+            ok(f"{agent}: {entry.name} 更新版已替换技能库（旧版备份 {backup}）")
+        elif action == "link":
+            shutil.rmtree(entry)
+            entry.symlink_to(dst, target_is_directory=True)
+            ok(f"{agent}: {entry.name} 已换成软链")
+        else:
+            backup = BACKUP / stamp / agent / entry.name
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(entry), str(backup))
+            entry.symlink_to(dst, target_is_directory=True)
+            ok(f"{agent}: {entry.name} 已换成软链（旧副本备份 {backup}）")
+        changed += 1
+
+    if changed and not args.no_meta:
+        build_meta(min_size=args.min, quiet=True)
+        ok("技能元已同步刷新")
+    return 0
+
+
+def cmd_agents(args) -> int:
+    cfg = load_config()
+    rows = agent_dirs(include_managed=True)
+    print(f"技能库: {STORE}\n")
+    print(f"{'agent':<12}{'技能目录':<44}{'技能数':>6}  状态")
+    for name, path in rows:
+        count = len([p for p in path.iterdir() if p.is_dir() or p.is_symlink()]) if path.is_dir() else 0
+        managed = name in {a[0] for a in AGENTS if a[2]}
+        state = "已启用" if path.is_dir() else "目录不存在"
+        if managed:
+            state += "（该目录由客户端托管，默认不写入）"
+        if name in set(cfg.get("disabled", [])):
+            state = "已禁用"
+        print(f"{name:<12}{str(path):<44}{count:>6}  {state}")
+    return 0
+
+
+def cmd_add(args) -> int:
+    src = resolve_source(args.source)
+    name = args.name or src.name
+    issues = validate(src)
+    errors = [m for lvl, m in issues if lvl == "error"]
+    if errors:
+        err(f"{src} 不是合法技能：")
+        for m in errors:
+            print(f"    - {m}")
+        return 1
+    for lvl, m in issues:
+        (warn if lvl == "warn" else err)(m)
+
+    if not copy_into_store(src, name, args.update):
+        return 1
+    ok(f"已安装到技能库: {STORE / name}")
+
+    if args.no_link:
+        return 0
+    results = {}
+    for agent, path in agent_dirs(include_managed=args.include_managed):
+        results[agent] = link_one(name, path, force=args.force)
+    _report_links(name, results)
+    if not args.no_meta:
+        build_meta(quiet=True)
+    return 0
+
+
+def _report_links(name: str, results: dict[str, str]) -> None:
+    labels = {
+        "create": "新建软链", "ok": "已是最新", "refresh": "刷新软链",
+        "replace": "替换为软链", "conflict": "冲突(已跳过)",
+    }
+    for agent, state in results.items():
+        if state == "conflict":
+            warn(f"{agent}: 已存在同名真实副本，未覆盖（加 --force 可备份后替换）")
+        else:
+            ok(f"{agent}: {labels[state]}")
+
+
+def cmd_link(args) -> int:
+    names = args.names or [p.name for p in store_skills()]
+    if not names:
+        err("技能库为空，先用 askill add 安装技能")
+        return 1
+    rc = 0
+    for name in names:
+        if not (STORE / name).is_dir():
+            err(f"技能库里没有 {name}")
+            rc = 1
+            continue
+        results = {}
+        for agent, path in agent_dirs(include_managed=args.include_managed):
+            results[agent] = link_one(name, path, force=args.force, dry=args.dry_run)
+        print(f"\n[{name}]" + ("  (dry-run)" if args.dry_run else ""))
+        _report_links(name, results)
+        if any(v == "conflict" for v in results.values()):
+            rc = 1
+    return rc
+
+
+def cmd_unlink(args) -> int:
+    names = args.names or [p.name for p in store_skills()]
+    for name in names:
+        for agent, path in agent_dirs(include_managed=True):
+            dst = link_target(path, name)
+            if dst.is_symlink():
+                dst.unlink()
+                ok(f"{agent}: 已移除软链 {name}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    skills = store_skills()
+    if not skills:
+        err(f"技能库为空: {STORE}")
+        return 1
+    agents = agent_dirs(include_managed=args.include_managed)
+    print(f"技能库 {STORE} 共 {len(skills)} 个技能，已分发到 {len(agents)} 个 agent\n")
+    header = f"{'skill':<24}" + "".join(f"{a:<10}" for a, _ in agents)
+    print(header)
+    print("-" * len(header))
+    for skill in skills:
+        cells = []
+        for _, path in agents:
+            dst = link_target(path, skill.name)
+            if dst.is_symlink():
+                cells.append(f"{GREEN}●{RESET}" + " " * 9)
+            elif dst.exists():
+                cells.append(f"{YELLOW}○{RESET}" + " " * 9)
+            else:
+                cells.append(f"{DIM}-{RESET}" + " " * 9)
+        print(f"{skill.name:<24}" + "".join(cells))
+    print(f"\n{GREEN}●{RESET} 软链正常  {YELLOW}○{RESET} 真实副本(会漂移)  {DIM}-{RESET} 未安装")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    errors = warns = 0
+    skills = store_skills()
+    print(f"== 技能库 {STORE} ==")
+    if not skills:
+        warn("技能库为空")
+    for skill in skills:
+        issues = validate(skill)
+        for lvl, msg in issues:
+            if lvl == "error":
+                err(f"{skill.name}: {msg}")
+                errors += 1
+            else:
+                warn(f"{skill.name}: {msg}")
+                warns += 1
+        if not issues:
+            ok(f"{skill.name}")
+
+    print("\n== 各 agent 目录 ==")
+    for agent, path in agent_dirs(include_managed=args.include_managed):
+        linked, drifted, broken, empty = [], [], [], []
+        for entry in path.iterdir():
+            if entry.name in SKIP_ENTRIES or entry.name.startswith("."):
+                continue
+            if entry.is_symlink():
+                if entry.exists():
+                    linked.append(entry.name)
+                else:
+                    broken.append(entry.name)
+            elif entry.is_dir():
+                if not any(entry.iterdir()):
+                    empty.append(entry.name)
+                elif (entry / "SKILL.md").is_file():
+                    drifted.append(entry.name)
+                else:
+                    empty.append(entry.name)
+        missing = [s.name for s in skills if s.name not in linked + drifted]
+        summary = f"{agent:<12} 软链 {len(linked):>2} / 副本 {len(drifted):>2} / 断链 {len(broken)} / 空 {len(empty)} / 缺分发 {len(missing)}"
+        print(summary)
+        if broken:
+            err(f"  断链: {', '.join(broken)}")
+            errors += len(broken)
+        if empty:
+            warn(f"  空目录/无 SKILL.md: {', '.join(empty)}")
+            warns += len(empty)
+        if drifted:
+            warn(f"  独立副本（会与技能库漂移）: {', '.join(drifted)}")
+            warns += len(drifted)
+        if missing:
+            dim(f"  技能库中未分发到此 agent: {', '.join(missing)}")
+
+    print()
+    if errors:
+        err(f"发现 {errors} 个错误、{warns} 个提醒")
+        return 1
+    ok(f"体检通过（{warns} 个提醒）")
+    return 0
+
+
+def cmd_migrate(args) -> int:
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else set()
+    groups: dict[str, list[tuple[str, Path]]] = {}
+    for agent, path in agent_dirs(include_managed=args.include_managed):
+        if args.from_agent and agent != args.from_agent:
+            continue
+        for entry in path.iterdir():
+            if entry.name in SKIP_ENTRIES or entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not any(entry.iterdir()):
+                continue
+            groups.setdefault(entry.name, []).append((agent, entry))
+
+    if not args.all:
+        groups = {
+            name: copies for name, copies in groups.items()
+            if (name in only) or (only == set() and len(copies) >= 2)
+        }
+
+    if not groups:
+        ok("没有需要收编的独立副本")
+        return 0
+
+    plan: list[str] = []
+    problems: list[str] = []
+    for name, copies in sorted(groups.items()):
+        existing = (STORE / name).is_dir()
+        digests = {tree_digest(p): p for _, p in copies}
+        if existing:
+            plan.append(f"{name}: 技能库已有，{len(copies)} 个副本将备份后替换为软链")
+        elif len(digests) == 1:
+            plan.append(f"{name}: {len(copies)} 份内容一致，收编 1 份进技能库")
+        else:
+            problems.append(f"{name}: {len(copies)} 份内容不一致（{len(digests)} 种版本），将取最新一份，其余备份")
+            plan.append(f"{name}: 收编最新版本，其余 {len(copies) - 1} 份备份")
+
+    print("收编计划：")
+    for line in plan:
+        print(f"  - {line}")
+    for line in problems:
+        warn(line)
+
+    if not args.apply:
+        print(f"\n这是 dry-run。确认无误后执行: askill migrate --apply")
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for name, copies in sorted(groups.items()):
+        if not (STORE / name).is_dir():
+            keeper = max(copies, key=lambda c: c[1].stat().st_mtime)[1]
+            issues = validate(keeper)
+            if any(lvl == "error" for lvl, _ in issues):
+                err(f"{name}: 唯一候选副本不合法，跳过收编")
+                for _, msg in issues:
+                    print(f"    - {msg}")
+                continue
+            STORE.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(keeper), str(STORE / name))
+            ok(f"收编 {keeper} -> {STORE / name}")
+        for agent, entry in copies:
+            if not entry.exists() and not entry.is_symlink():
+                continue
+            if entry.is_symlink():
+                continue
+            backup = BACKUP / stamp / agent / name
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(entry), str(backup))
+            entry.symlink_to(STORE / name, target_is_directory=True)
+            ok(f"{agent}: 副本已备份并替换为软链")
+    print(f"\n原副本全部备份在 {BACKUP / stamp}")
+    return 0
+
+
+def cmd_clean(args) -> int:
+    removed = 0
+    for agent, path in agent_dirs(include_managed=args.include_managed):
+        for entry in path.iterdir():
+            if entry.name.startswith(".") or entry.name in SKIP_ENTRIES:
+                continue
+            if entry.is_symlink() and not entry.exists():
+                if args.apply:
+                    entry.unlink()
+                print(f"{agent}: 断链 {entry.name}" + ("" if args.apply else " (dry-run)"))
+                removed += 1
+            elif entry.is_dir() and not any(entry.iterdir()):
+                if args.apply:
+                    entry.rmdir()
+                print(f"{agent}: 空目录 {entry.name}" + ("" if args.apply else " (dry-run)"))
+                removed += 1
+    if not removed:
+        ok("没有可清理的条目")
+    elif not args.apply:
+        print("\n加 --apply 才会真正删除")
+    return 0
+
+
+def cmd_remove(args) -> int:
+    name = args.name
+    for agent, path in agent_dirs(include_managed=True):
+        dst = link_target(path, name)
+        if dst.is_symlink():
+            dst.unlink()
+            ok(f"{agent}: 已移除软链")
+        elif dst.exists() and args.purge:
+            warn(f"{agent}: 存在独立副本，未删除（请手动确认）")
+    if args.purge and (STORE / name).is_dir():
+        backup = BACKUP / time.strftime("%Y%m%d-%H%M%S") / "store" / name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(STORE / name), str(backup))
+        ok(f"技能库副本已备份到 {backup}")
+        build_meta(quiet=True)
+    return 0
+
+
+def body_of(md: Path) -> str:
+    text = md.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return text
+    parts = re.split(r"\n---[ \t]*\n", text, maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].lstrip("\n")
+
+
+def cmd_export(args) -> int:
+    dest = Path(args.to).expanduser()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    skills = [s for s in store_skills() if not s.name.startswith(".")]
+    if not skills:
+        err(f"技能库为空: {STORE}")
+        return 1
+    cfg = load_config()
+    infos = {s.name: skill_info(s) for s in skills}
+    metas = {n for n in infos if n.endswith(META_SUFFIX)}
+    real = {n: i for n, i in infos.items() if n not in metas}
+
+    prefix_counts = Counter((name_tokens(n) or ["other"])[0] for n in real)
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for name, info in real.items():
+        grouped[infer_category(info, prefix_counts, cfg, args.group_by)].append(name)
+
+    # 删除目标目录里旧的本工具生成的笔记，避免残留已删除技能
+    for old in dest.glob("*.md"):
+        old.unlink()
+        dim(f"清理旧笔记 {old.name}")
+
+    written = 0
+
+    def emit(name: str, is_meta: bool) -> None:
+        nonlocal written
+        info = infos[name]
+        cat = info["category"] or infer_category(info, prefix_counts, cfg, args.group_by)
+        tags = ["skill"] + (["meta"] if is_meta else []) + ([cat] if cat else [])
+        tag_str = ", ".join(tags)
+        body = body_of(STORE / name / "SKILL.md")
+        content = (
+            f"---\n"
+            f"tags: [{tag_str}]\n"
+            f"source: ~/.agent-skills/{name}\n"
+            f"---\n\n"
+            f"# {name}\n\n"
+            f"> {info['summary']}\n\n"
+            f"{body.rstrip()}\n"
+        )
+        (dest / f"{name}.md").write_text(content, encoding="utf-8")
+        written += 1
+
+    for name in sorted(real):
+        emit(name, False)
+    for name in sorted(metas):
+        emit(name, True)
+
+    # 总览
+    lines = [f"# 技能总览\n", f"> 由 `askill export` 生成，共 {len(real)} 个技能、{len(metas)} 个技能元。\n"]
+    for cat in sorted(grouped):
+        names = sorted(grouped[cat])
+        lines.append(f"\n## {cat}（{len(names)}）\n")
+        lines.append("| 技能 | 摘要 |")
+        lines.append("|---|---|")
+        for n in names:
+            lines.append(f"| [[{n}]] | {infos[n]['summary']} |")
+    if metas:
+        lines.append(f"\n## 技能元（{len(metas)}）\n")
+        lines.append("| 技能元 | 摘要 |")
+        lines.append("|---|---|")
+        for n in sorted(metas):
+            lines.append(f"| [[{n}]] | {infos[n]['summary']} |")
+    (dest / "00-技能总览.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    written += 1
+
+    ok(f"已导出 {written - 1} 个技能笔记 + 1 个总览到 {dest}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="askill", description="一处安装，所有 agent 共用技能")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("agents", help="查看探测到的 agent 技能目录")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_agents)
+
+    p = sub.add_parser("add", help="安装技能到技能库并分发")
+    p.add_argument("source")
+    p.add_argument("--name")
+    p.add_argument("--update", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-link", action="store_true")
+    p.add_argument("--no-meta", action="store_true")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("link", help="补/刷新软链")
+    p.add_argument("names", nargs="*")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("unlink", help="移除软链")
+    p.add_argument("names", nargs="*")
+    p.set_defaults(func=cmd_unlink)
+
+    p = sub.add_parser("list", help="列出技能库与分发矩阵")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("doctor", help="体检")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("migrate", help="收编已有副本（默认只收编重复出现的技能）")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--all", action="store_true", help="收编所有独立副本")
+    p.add_argument("--only", help="只收编指定技能，逗号分隔")
+    p.add_argument("--from-agent", help="只从某个 agent 目录收编")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_migrate)
+
+    p = sub.add_parser("collect", help="收编任意 agent 里新建的技能（单个也算）")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--only", help="只收编指定技能，逗号分隔")
+    p.add_argument("--from-agent", help="只从某个 agent 目录收编")
+    p.add_argument("--min", type=int, default=2, help="生成技能元所需同类技能数（默认 2）")
+    p.add_argument("--no-meta", action="store_true", help="收编后不刷新技能元")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("meta", help="为同类技能生成技能元（3 行摘要检索）")
+    p.add_argument("--min", type=int, default=2, help="同类技能数达到多少才生成（默认 2）")
+    p.add_argument("--group-by", default="auto", choices=["auto", "prefix", "flat"])
+    p.add_argument("--no-link", action="store_true", help="只生成，不分发")
+    p.set_defaults(func=cmd_meta)
+
+    p = sub.add_parser("clean", help="清理空目录/断链")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--include-managed", action="store_true")
+    p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("remove", help="删除技能")
+    p.add_argument("name")
+    p.add_argument("--purge", action="store_true")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("export", help="把技能库导出为 Obsidian 笔记（方便查阅）")
+    p.add_argument("--to", required=True, help="目标目录，例如 Obsidian 库下的 OPC/AI Agent/skills")
+    p.add_argument("--group-by", default="auto", choices=["auto", "prefix", "flat"])
+    p.set_defaults(func=cmd_export)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
