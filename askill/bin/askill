@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -45,7 +46,7 @@ DEFAULT_CATEGORY_KEYWORDS = {
     "office": ["docx", "xlsx", "pptx", "pdf", "word", "excel", "slide", "sheet", "office", "csv"],
     "research": ["research", "reach", "search", "web", "news", "find", "lookup"],
     "design": ["design", "ui", "ux", "frontend", "css", "taste", "figma", "visual", "style"],
-    "code": ["code", "dev", "git", "deploy", "test", "refactor", "bug", "pr", "project", "init"],
+    "code": ["code", "dev", "git", "deploy", "test", "refactor", "bug", "init"],
     "review": ["review", "retro", "audit", "postmortem", "check"],
     "media": ["video", "remotion", "audio", "image", "motion", "music", "podcast"],
     "writing": ["blog", "post", "writer", "copy", "email", "mail", "draft", "translate"],
@@ -297,9 +298,11 @@ def skill_info(skill_dir: Path) -> dict:
 
 
 def category_keywords(cfg: dict) -> dict[str, list[str]]:
-    merged = {k: list(v) for k, v in DEFAULT_CATEGORY_KEYWORDS.items()}
+    merged: dict[str, list[str]] = {}
     for cat, words in (cfg.get("category_keywords") or {}).items():
-        merged[cat] = [str(w).lower() for w in words]
+        merged[str(cat)] = [str(w).lower() for w in words]
+    for cat, words in DEFAULT_CATEGORY_KEYWORDS.items():
+        merged.setdefault(cat, list(words))
     return merged
 
 
@@ -307,14 +310,23 @@ def name_tokens(name: str) -> list[str]:
     return [t for t in re.split(r"[-_./ ]+", name.lower()) if t]
 
 
+def cat_root(cat: str) -> str:
+    return (cat or "other").split("/")[0]
+
+
+def cat_sub(cat: str) -> str:
+    parts = (cat or "").split("/", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
 def infer_category(info: dict, prefix_counts: Counter, cfg: dict, mode: str) -> str:
-    if info["category"]:
-        return info["category"]
+    if mode == "flat":
+        return "all"
     cat_map = cfg.get("categories") or {}
     if info["name"] in cat_map:
         return str(cat_map[info["name"]])
-    if mode == "flat":
-        return "all"
+    if info["category"]:
+        return info["category"]
     tokens = name_tokens(info["name"])
     for cat, words in category_keywords(cfg).items():
         if any(w in tokens or any(t.startswith(w) for t in tokens) for w in words):
@@ -326,13 +338,14 @@ def infer_category(info: dict, prefix_counts: Counter, cfg: dict, mode: str) -> 
 
 
 META_SCRIPT = '''#!/usr/bin/env python3
-"""技能元检索：按关键词/名称/标签返回 3 行摘要，不加载完整 SKILL.md。
+"""技能元检索：按场景分组 / 关键词 / 名称 / 标签返回摘要，不加载完整 SKILL.md。
 
 用法:
-    python3 meta.py --list
+    python3 meta.py --groups              # 本类下的场景分组（二次分级）
+    python3 meta.py --group 交付          # 只看某个场景分组
+    python3 meta.py --list                # 全部技能（按分组排列）
     python3 meta.py --keyword "导出"
     python3 meta.py --name docx
-    python3 meta.py --tag office
 """
 
 import argparse
@@ -350,6 +363,10 @@ def load():
     return json.loads(INDEX.read_text(encoding="utf-8"))
 
 
+def group_of(it):
+    return it.get("group") or "未分组"
+
+
 def render(items, detail, title):
     if not items:
         print("没有匹配的技能。换个关键词，或用 --list 看全部。")
@@ -357,19 +374,44 @@ def render(items, detail, title):
     print(f"\\n=== {title} {len(items)} 个技能 ===\\n")
     for it in items:
         tags = ",".join(it.get("tags") or [])
+        g = group_of(it)
         if detail:
-            print(f"  {it['name']}")
+            print(f"  {it['name']}  [{g}]")
             print(f"    摘要：{it['summary']}")
             print(f"    标签：{tags or '-'}")
             print(f"    路径：{it['path']}/SKILL.md")
             print()
         else:
-            print(f"  {it['name']} — {it['summary']}" + (f" [{tags}]" if tags else ""))
+            print(f"  {it['name']} — {it['summary']}"
+                  + (f" [{tags}]" if tags else "") + f"  ·{g}")
+
+
+def render_grouped(items, detail, title):
+    if not items:
+        print("没有匹配的技能。")
+        return
+    print(f"\\n=== {title} {len(items)} 个技能 ===")
+    groups = {}
+    for it in items:
+        groups.setdefault(group_of(it), []).append(it)
+    for g in sorted(groups):
+        print(f"\\n-- {g}（{len(groups[g])}）--")
+        for it in sorted(groups[g], key=lambda x: x["name"]):
+            tags = ",".join(it.get("tags") or [])
+            if detail:
+                print(f"  {it['name']}")
+                print(f"    摘要：{it['summary']}")
+                print(f"    标签：{tags or '-'}")
+                print(f"    路径：{it['path']}/SKILL.md")
+            else:
+                print(f"  {it['name']} — {it['summary']}" + (f" [{tags}]" if tags else ""))
 
 
 def main():
     p = argparse.ArgumentParser(description="skill meta index search")
     p.add_argument("--list", action="store_true")
+    p.add_argument("--groups", action="store_true", help="列出场景分组")
+    p.add_argument("--group", help="只看某个场景分组")
     p.add_argument("--keyword")
     p.add_argument("--name")
     p.add_argument("--tag")
@@ -377,8 +419,16 @@ def main():
     a = p.parse_args()
     data = load()
     skills = data["skills"]
+    if a.groups:
+        groups = data.get("groups") or {}
+        print(f"\\n=== {data['category']} 场景分组：{len(groups)} 组 / {data['total']} 个技能 ===\\n")
+        for g, n in groups.items():
+            names = sorted(it["name"] for it in skills if group_of(it) == g)
+            print(f"  {g}（{n}）")
+            print(f"    {', '.join(names)}")
+        return
     if a.list:
-        render(skills, a.detail, "全部")
+        render_grouped(skills, a.detail, "全部")
     elif a.name:
         hit = [s for s in skills if s["name"].lower() == a.name.lower()]
         render(hit, True, f"「{a.name}」")
@@ -392,9 +442,15 @@ def main():
                or kw in s.get("description", "").lower()
                or any(kw in t.lower() for t in (s.get("tags") or []))]
         render(hit, a.detail, f"关键词「{a.keyword}」")
+    elif a.group:
+        hit = [s for s in skills if group_of(s).lower() == a.group.lower()]
+        render(hit, a.detail, f"分组「{a.group}」")
     else:
-        print(f"{data['category']} 技能元：{data['total']} 个技能")
-        print("用 --list / --keyword / --name / --tag 检索；加 --detail 看路径。")
+        groups = data.get("groups") or {}
+        print(f"{data['category']} 技能元：{data['total']} 个技能、{len(groups)} 个场景分组")
+        for g, n in groups.items():
+            print(f"  {g}（{n}）")
+        print("\\n用 --group <分组> / --keyword / --name / --tag 检索；加 --detail 看路径。")
 
 
 if __name__ == "__main__":
@@ -403,26 +459,46 @@ if __name__ == "__main__":
 
 
 def meta_skill_md(cat: str, items: list[dict]) -> str:
-    rows = "\n".join(
-        f"| {it['name']} | {it['summary']} | {', '.join(it['tags']) or '-'} |" for it in items
-    )
+    by_group: dict[str, list[dict]] = defaultdict(list)
+    for it in items:
+        by_group[it.get("group") or "未分组"].append(it)
+    sections = []
+    for g in sorted(by_group):
+        rows = "\n".join(
+            f"| {it['name']} | {it['summary']} | {', '.join(it['tags']) or '-'} |"
+            for it in sorted(by_group[g], key=lambda x: x["name"])
+        )
+        sections.append(
+            f"### {g}（{len(by_group[g])}）\n\n| 技能 | 摘要 | 标签 |\n|---|---|---|\n{rows}"
+        )
+    rows = "\n\n".join(sections)
     desc = (
-        f"{len(items)} 个「{cat}」类技能的索引。按关键词、名称或标签检索，只返回 3 行摘要，"
-        "不加载完整 SKILL.md，用于快速定位并节省 token。当你不确定该类里该用哪个技能、"
-        "或只想快速确认某技能用途时使用；确定目标后再读它的 SKILL.md 执行。"
+        f"{len(items)} 个「{cat}」类技能的索引，按 {len(by_group)} 个场景分组二次分级。"
+        "先按分组定位、再用关键词检索，只返回摘要，不加载完整 SKILL.md，节省 token。"
+        "当你不确定该类里该用哪个技能、或只想快速确认某技能用途时使用；确定目标后再读它的 SKILL.md 执行。"
     )
+    group_list = "、".join(f"{g}({len(by_group[g])})" for g in sorted(by_group))
     return f"""---
 name: {cat}-meta
 description: {desc}
 metadata:
   generated_by: askill
   category: {cat}
+  groups: [{', '.join(sorted(by_group))}]
   tags: [index, search, token-saving, {cat}]
 ---
 
 # {cat} Meta — 技能元索引
 
-用一句话定位该类里该用哪个技能，只返回 3 行摘要，不加载完整文档。
+用一句话定位该类里该用哪个技能，只返回摘要，不加载完整文档。
+
+## 二次分级（场景分组）
+
+{group_list}
+
+| 分组 | 数量 | 什么时候看这组 |
+|---|---|---|
+{chr(10).join(f"| {g} | {len(by_group[g])} | 见下方「{g}」小节 |" for g in sorted(by_group))}
 
 ## 何时用
 
@@ -438,7 +514,9 @@ metadata:
 ## 命令
 
 ```bash
-python3 ~/.agent-skills/{cat}-meta/meta.py --list
+python3 ~/.agent-skills/{cat}-meta/meta.py            # 看分组概览
+python3 ~/.agent-skills/{cat}-meta/meta.py --groups    # 分组 + 每组技能名
+python3 ~/.agent-skills/{cat}-meta/meta.py --group "{sorted(by_group)[0]}"   # 只看一组
 python3 ~/.agent-skills/{cat}-meta/meta.py --keyword "导出"
 python3 ~/.agent-skills/{cat}-meta/meta.py --name docx
 python3 ~/.agent-skills/{cat}-meta/meta.py --tag {cat} --detail
@@ -447,15 +525,13 @@ python3 ~/.agent-skills/{cat}-meta/meta.py --tag {cat} --detail
 输出（单行）：
 
 ```
-  docx — 创建、读取、编辑 Word 文档 [office, document]
+  docx — 创建、读取、编辑 Word 文档 [office, document]  ·文档
 ```
 
 加 `--detail` 会多给路径，确认后再读那个 SKILL.md。
 
 ## 技能清单（{len(items)} 个）
 
-| 技能 | 摘要 | 标签 |
-|---|---|---|
 {rows}
 """
 
@@ -486,7 +562,9 @@ def build_meta(min_size: int = 2, mode: str = "auto", quiet: bool = False,
     prefix_counts = Counter((name_tokens(i["name"]) or ["other"])[0] for i in infos)
     groups: dict[str, list[dict]] = defaultdict(list)
     for info in infos:
-        groups[infer_category(info, prefix_counts, cfg, mode)].append(info)
+        cat = infer_category(info, prefix_counts, cfg, mode)
+        info["group"] = cat_sub(cat)
+        groups[cat_root(cat)].append(info)
 
     final: dict[str, list[dict]] = {}
     others: list[dict] = []
@@ -517,11 +595,13 @@ def build_meta(min_size: int = 2, mode: str = "auto", quiet: bool = False,
                 warn(f"{meta_name} 已被 {', '.join(hand_written)} 中的手写技能元占用，跳过自动生成")
                 continue
         d.mkdir(parents=True, exist_ok=True)
-        items = sorted(items, key=lambda x: x["name"])
+        items = sorted(items, key=lambda x: (x.get("group") or "", x["name"]))
+        gcount = Counter(i.get("group") or "未分组" for i in items)
         index = {
             "category": cat,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "total": len(items),
+            "groups": dict(sorted(gcount.items())),
             "skills": items,
         }
         (d / "index.json").write_text(
@@ -779,10 +859,14 @@ def cmd_doctor(args) -> int:
                 else:
                     broken.append(entry.name)
             elif entry.is_dir():
-                if not any(entry.iterdir()):
-                    empty.append(entry.name)
-                elif (entry / "SKILL.md").is_file():
+                if (entry / "SKILL.md").is_file():
                     drifted.append(entry.name)
+                elif not any(entry.iterdir()):
+                    empty.append(entry.name)
+                elif any(entry.glob("*/SKILL.md")) or any(entry.glob("*/*/SKILL.md")):
+                    continue
+                elif (entry / "DESCRIPTION.md").is_file():
+                    continue
                 else:
                     empty.append(entry.name)
         missing = [s.name for s in skills if s.name not in linked + drifted]
@@ -883,6 +967,41 @@ def cmd_migrate(args) -> int:
     return 0
 
 
+def _norm_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", (text or "").lower()).strip()
+
+
+def cmd_dupes(args) -> int:
+    skills = [s for s in store_skills()
+              if not s.name.endswith(META_SUFFIX) and not s.name.startswith(".")]
+    infos = [skill_info(s) for s in skills]
+    pairs = []
+    for i, a in enumerate(infos):
+        for b in infos[i + 1:]:
+            n_sim = difflib.SequenceMatcher(
+                None, a["name"].replace("-", ""), b["name"].replace("-", "")).ratio()
+            d_sim = difflib.SequenceMatcher(
+                None, _norm_text(a["summary"]), _norm_text(b["summary"])).ratio()
+            score = max(n_sim, d_sim)
+            if score >= args.threshold:
+                pairs.append((round(score, 3), round(n_sim, 3), round(d_sim, 3), a, b))
+    pairs.sort(key=lambda x: -x[0])
+    if not pairs:
+        ok(f"没有相似度 ≥ {args.threshold} 的技能对")
+        return 0
+    print(f"发现 {len(pairs)} 对疑似重复技能（阈值 {args.threshold}）：\n")
+    for score, n_sim, d_sim, a, b in pairs[: args.limit]:
+        print(f"  {score}  名字 {n_sim} / 描述 {d_sim}")
+        print(f"    {a['name']:<28} {a['summary']}")
+        print(f"    {b['name']:<28} {b['summary']}")
+        print()
+    if len(pairs) > args.limit:
+        print(f"（只显示前 {args.limit} 对，共 {len(pairs)} 对；用 --limit 调整）")
+    print("合并/下线请人工判断：确认后跑 `askill remove <技能> --purge`，")
+    print("只想给 agent 少点噪音可跑 `askill unlink <技能>`（技能库保留）。")
+    return 0
+
+
 def cmd_clean(args) -> int:
     removed = 0
     for agent, path in agent_dirs(include_managed=args.include_managed):
@@ -952,18 +1071,37 @@ def cmd_export(args) -> int:
     for name, info in real.items():
         grouped[infer_category(info, prefix_counts, cfg, args.group_by)].append(name)
 
+    layout = getattr(args, "layout", "flat") or "flat"
+    detail_dir = dest if layout == "flat" else dest / getattr(args, "detail_dir", "01-技能详情")
+    detail_dir.mkdir(parents=True, exist_ok=True)
+
     # 删除目标目录里旧的本工具生成的笔记，避免残留已删除技能
-    for old in dest.glob("*.md"):
-        old.unlink()
-        dim(f"清理旧笔记 {old.name}")
+    removed = 0
+    for old in dest.rglob("*.md"):
+        try:
+            head = old.read_text(encoding="utf-8", errors="replace")[:400]
+        except OSError:
+            continue
+        if "source: ~/.agent-skills/" in head or old.name == "00-技能总览.md":
+            old.unlink()
+            removed += 1
+    for d in sorted(dest.rglob("*"), reverse=True):
+        if d.is_dir() and d != dest and not any(d.iterdir()):
+            d.rmdir()
+    if removed:
+        dim(f"清理旧笔记 {removed} 个")
 
     written = 0
 
     def emit(name: str, is_meta: bool) -> None:
         nonlocal written
         info = infos[name]
-        cat = info["category"] or infer_category(info, prefix_counts, cfg, args.group_by)
-        tags = ["skill"] + (["meta"] if is_meta else []) + ([cat] if cat else [])
+        cat = infer_category(info, prefix_counts, cfg, args.group_by)
+        root = cat_root(cat) if cat else "other"
+        tags = ["skill"] + (["meta"] if is_meta else []) + ([root] if root != "all" else [])
+        sub = cat_sub(cat)
+        if sub:
+            tags.append(sub)
         tag_str = ", ".join(tags)
         body = body_of(STORE / name / "SKILL.md")
         content = (
@@ -975,7 +1113,11 @@ def cmd_export(args) -> int:
             f"> {info['summary']}\n\n"
             f"{body.rstrip()}\n"
         )
-        (dest / f"{name}.md").write_text(content, encoding="utf-8")
+        target = detail_dir / f"{name}.md"
+        if layout == "category":
+            target = detail_dir / (cat or "other") / f"{name}.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
         written += 1
 
     for name in sorted(real):
@@ -984,14 +1126,33 @@ def cmd_export(args) -> int:
         emit(name, True)
 
     # 总览
-    lines = [f"# 技能总览\n", f"> 由 `askill export` 生成，共 {len(real)} 个技能、{len(metas)} 个技能元。\n"]
-    for cat in sorted(grouped):
-        names = sorted(grouped[cat])
-        lines.append(f"\n## {cat}（{len(names)}）\n")
-        lines.append("| 技能 | 摘要 |")
-        lines.append("|---|---|")
-        for n in names:
-            lines.append(f"| [[{n}]] | {infos[n]['summary']} |")
+    tree: dict[str, dict[str, list[str]]] = {}
+    for cat, names in grouped.items():
+        tree.setdefault(cat_root(cat), {}).setdefault(cat_sub(cat) or "未分组", []).extend(names)
+    n_subs = sum(len(v) for v in tree.values())
+    lines = [
+        "# 技能总览\n",
+        f"> 由 `askill export` 生成，共 {len(real)} 个技能、{len(metas)} 个技能元，"
+        f"按 {len(tree)} 个分类 / {n_subs} 个场景分组组织。\n",
+        "\n## 分类与场景速查\n",
+        "| 分类 | 场景分组（数量） |",
+        "|---|---|",
+    ]
+    for root in sorted(tree):
+        subs = tree[root]
+        total = sum(len(v) for v in subs.values())
+        cell = "、".join(f"{s}({len(subs[s])})" for s in sorted(subs))
+        lines.append(f"| **{root}**（{total}） | {cell} |")
+    for root in sorted(tree):
+        subs = tree[root]
+        lines.append(f"\n## {root}（{sum(len(v) for v in subs.values())}）\n")
+        for s in sorted(subs):
+            names = sorted(subs[s])
+            lines.append(f"\n### {s}（{len(names)}）\n")
+            lines.append("| 技能 | 摘要 |")
+            lines.append("|---|---|")
+            for n in names:
+                lines.append(f"| [[{n}]] | {infos[n]['summary']} |")
     if metas:
         lines.append(f"\n## 技能元（{len(metas)}）\n")
         lines.append("| 技能元 | 摘要 |")
@@ -1001,7 +1162,7 @@ def cmd_export(args) -> int:
     (dest / "00-技能总览.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     written += 1
 
-    ok(f"已导出 {written - 1} 个技能笔记 + 1 个总览到 {dest}")
+    ok(f"已导出 {written - 1} 个技能笔记 + 1 个总览到 {detail_dir}（布局 {layout}）")
     return 0
 
 
@@ -1037,6 +1198,11 @@ def main() -> int:
     p = sub.add_parser("list", help="列出技能库与分发矩阵")
     p.add_argument("--include-managed", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("dupes", help="找出疑似重复/重叠的技能对")
+    p.add_argument("--threshold", type=float, default=0.6, help="相似度阈值，默认 0.6")
+    p.add_argument("--limit", type=int, default=30, help="最多显示多少对，默认 30")
+    p.set_defaults(func=cmd_dupes)
 
     p = sub.add_parser("doctor", help="体检")
     p.add_argument("--include-managed", action="store_true")
@@ -1078,6 +1244,9 @@ def main() -> int:
     p = sub.add_parser("export", help="把技能库导出为 Obsidian 笔记（方便查阅）")
     p.add_argument("--to", required=True, help="目标目录，例如 Obsidian 库下的 OPC/AI Agent/skills")
     p.add_argument("--group-by", default="auto", choices=["auto", "prefix", "flat"])
+    p.add_argument("--layout", default="flat", choices=["flat", "subdir", "category"],
+                   help="flat=平铺到目标目录；subdir=放进子目录；category=按分类分子目录")
+    p.add_argument("--detail-dir", default="01-技能详情", help="subdir/category 布局下的子目录名")
     p.set_defaults(func=cmd_export)
 
     args = parser.parse_args()

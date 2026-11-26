@@ -16,7 +16,7 @@ venv/
 *.bak
 
 # 个人 / 敏感文件（不随仓库分发）
-记忆库.md
+gh-release/记忆库.md
 SMO-finder
 
 # 本机安装的其他 skill（各自独立维护，不随此仓库分发）

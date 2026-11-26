@@ -16,7 +16,7 @@ description: 一处安装、所有 agent 共用的技能库管理工具（软链
 
 ## 安装
 
-脚本位于本仓库 `bin/askill`，软链到 PATH 即可：
+脚本位于本仓库 `bin`，软链到 PATH 即可：
 
 ```bash
 ln -s "$(pwd)/bin/askill" ~/.local/bin/askill
@@ -30,6 +30,7 @@ ln -s "$(pwd)/bin/askill" ~/.local/bin/askill
 | `askill agents` | 查看探测到的 agent 技能目录 |
 | `askill list` | 技能库与分发矩阵（谁有谁没有） |
 | `askill doctor` | 体检（断链 / 缺分发 / 漂移副本 / 空目录） |
+| `askill dupes [--threshold N]` | 找疑似重复/重叠的技能对（人工判断后再合并） |
 
 ### 安装与分发
 | 命令 | 用途 |
@@ -66,7 +67,7 @@ python3 ~/.agent-skills/office-meta/meta.py --name docx
 ### 导出
 | 命令 | 用途 |
 |---|---|
-| `askill export --to <obsidian目录>` | 把技能库导出为 Obsidian 笔记（分类总览 + 每技能一篇，带 tags 和双链） |
+| `askill export --to <obsidian目录> [--layout flat\|subdir\|category]` | 把技能库导出为 Obsidian 笔记（分类总览 + 每技能一篇，带 tags 和双链） |
 
 ## 典型工作流
 
@@ -88,7 +89,10 @@ askill export --to "~/Downloads/Documents/Obsidian Vault/OPC/AI Agent/skills"
 
 ## 分类规则
 
-类别判定优先级：frontmatter 的 `category` → `config.json` 的 `categories` → 内置关键词表（pm / office / research / design / code / review / media / writing / data / agent）→ 名称前缀（≥2 个同名前缀才成类）→ `other`。同类不足 `--min`（默认 2）个不生成技能元。
+类别判定优先级：`config.json` 的 `categories`（显式指定，最高）→ frontmatter 的 `category` → `config.json` 的 `category_keywords` / 内置关键词表 → 名称前缀（≥2 个同名前缀才成类）→ `other`。同类不足 `--min`（默认 2）个不生成技能元。
+
+**两级分类**：`categories` 的值支持 `分类/场景`，即「内容域 → 场景」二次分级。技能元按场景分节，`meta.py --groups` 看分组、`--group <场景>` 只进一组；导出 `--layout category` 也按两层建目录。想让分组更细，直接在 `config.json` 里逐个技能改值再跑 `askill meta`，无需改代码。
+
 
 ## 安全设计
 
