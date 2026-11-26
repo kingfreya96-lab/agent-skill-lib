@@ -46,11 +46,14 @@ ln -s "$(pwd)/askill/bin/askill" ~/.local/bin/askill
 ```
 .
 ├── askill/
-│   ├── SKILL.md     # askill 的 skill 描述
-│   ├── bin/askill   # 命令行入口（Python 脚本）
-│   └── README.md
-└── .trae/rules/     # 项目维护规则
+│   ├── SKILL.md        # askill 的 skill 描述
+│   ├── bin/askill      # 命令行入口（Python 脚本）
+│   ├── README.md       # 本说明
+│   └── CHANGELOG.md    # 更新日志
+└── .gitignore
 ```
+
+> 本仓库只装 `askill` 本体；项目级文件（`.trae/`、`docs/`、其他 skill 目录）不进本仓库。
 
 ## 分类配置
 

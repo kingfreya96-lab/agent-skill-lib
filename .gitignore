@@ -23,3 +23,8 @@ SMO-finder
 gh-release/
 model-selection/
 ProductManager-*/
+
+# 项目级文件（不进 skill 仓库、不推送 GitHub）
+.trae/
+docs/
+README.md
